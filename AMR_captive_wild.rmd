@@ -1,0 +1,863 @@
+---
+title: "AMR_cpative_wild"
+output: html_document
+date: "2026-07-01"
+---
+
+```{r setup, include=FALSE}
+library(Biostrings)
+library(MASS)
+#library(ape)
+library(vegan)
+#library(MKinfer)
+#library(ecodist)
+library(phytools)
+#library(nlme)
+#library(lme4)
+#library(ggrepel)
+library(glmmTMB)
+#library(patchwork)
+#library(ggpubr)
+library(data.table)
+library(ape)
+library(geomorph)
+library(RRPP)
+library(DHARMa)
+library(tidyverse)
+library(ggtree)
+
+install.packages("DHARMa")
+
+R.version.string
+
+```
+
+#Create base analysis file
+```{r}
+#Read in MAG metadata
+MAG_meta <- read_csv(file = "MAG_metadata_AMR_fixed.csv") %>% rename(genome = MAG_ID)
+
+#Parse AMRfinder outputs
+AMR_files <- list.files("amrfinder_out", full.names = TRUE, pattern = "\\.tsv$")
+
+AMR_combined <- rbindlist(
+  lapply(
+    AMR_files, 
+    function(f){fread(f)[, genome := str_remove(basename(f), "\\.tsv$")]}
+         ), 
+  fill = TRUE
+)
+
+#AMR_combined %>% write_csv(file = "amr_out_combined.csv")
+
+#read in dRep clustering data
+drep_clustering <- read_csv(file = "MAGs/pass/drep_out/data_tables/Cdb.csv") %>% mutate(genome = str_remove(genome, "\\.fa$"))
+
+
+#Combine amr outs, mag meta, and drep clustering
+combined_amr_data <- left_join(AMR_combined, select(MAG_meta, genome, common_host, status, completeness, contamination, phylum, class, family, genus, species, sample_id, study, run_thru_sn_mg_pipeline, country, city), by = "genome") %>% left_join(., select(drep_clustering, genome, secondary_cluster), by = "genome") %>% select(genome,common_host, status, secondary_cluster,everything())
+
+
+#also need drep cluster membership
+cluster_members <- left_join(select(drep_clustering, genome, secondary_cluster), select(MAG_meta, genome, common_host, status))
+
+MAG_meta %>% distinct(common_host)
+combined_amr_data %>% distinct(common_host)
+AMR_combined
+combined_amr_data %>% distinct(common_host)
+
+```
+
+#Wildlife MAG tree annotation (-humans and -Koala)
+```{r}
+#Full MAG tree could be visualized, but not really with the way we want to annotate it. Tree has ~6000 tips, so any information like AMR abundance would be a 1/6000th slice of the tree. Going to split tree into per host trees. This makes the largest tree ~2000 tips, still a bit hard to visualize annotations, but could either show off Hosts with fewer MAGs or zoom into interesting parts of the tree
+
+#number of MAGs in full tree per common host
+AMR_combined %>% 
+  filter(Scope == "core" & Type == "AMR") %>% 
+  group_by(genome) %>% 
+  summarise(AMR_abundance = n()) %>% 
+  full_join(., select(MAG_meta, genome, common_host, status), by = "genome") %>% 
+  mutate(AMR_abundance = replace_na(AMR_abundance, 0)) %>% 
+  filter(common_host != "Human" & common_host != "Koala") %>% 
+  filter(genome %in% full_tree$tip.label) %>% 
+  group_by(common_host) %>% 
+  summarise(n = n())
+
+
+
+#definitely easier ways to make a list of hosts, but this makes sure each host is actually in the tree. 
+host_list <- AMR_combined %>% 
+  filter(Scope == "core" & Type == "AMR") %>% 
+  group_by(genome) %>% 
+  summarise(AMR_abundance = n()) %>% 
+  full_join(., select(MAG_meta, genome, common_host, status), by = "genome") %>% 
+  mutate(AMR_abundance = replace_na(AMR_abundance, 0)) %>% 
+  filter(common_host != "Human" & common_host != "Koala") %>% 
+  filter(genome %in% full_tree$tip.label) %>% 
+  distinct(common_host) %>% 
+  pull()
+
+per_host_tree_list <- list()
+per_host_tree_annotate_list <- list()
+
+for (host in host_list) {
+  
+  tmp_host_tree_df <- AMR_combined %>% 
+    filter(Scope == "core" & Type == "AMR") %>% 
+    group_by(genome) %>% 
+    summarise(AMR_abundance = n()) %>% 
+    full_join(., select(MAG_meta, genome, common_host, status), by = "genome") %>% 
+    mutate(AMR_abundance = replace_na(AMR_abundance, 0)) %>% 
+    filter(common_host != "Human" & common_host != "Koala") %>% 
+    filter(genome %in% full_tree$tip.label) %>% 
+    left_join(., select(MAG_meta, genome, phylum, class, family, genus, species)) %>% 
+    filter(common_host == host)
+  
+  
+  tmp_tree <- keep.tip.phylo(full_tree, tmp_host_tree_df$genome)
+  
+  per_host_tree_list[[host]] <- tmp_tree
+  
+  per_host_tree_annotate_list[[host]] <- select(tmp_host_tree_df, genome, AMR_abundance, common_host, status, phylum)
+  
+}
+
+per_host_tree_list[[host]]
+per_host_tree_annotate_list
+```
+
+#MAG PGLS
+```{r}
+
+#MAG tree with ALL the samples from the study (except is missing some). Might want to re-infer tree with more specific set of MAGs
+full_tree <- read.tree(file = "all_animal+drep95_human.txt")
+
+#Full AMR abundance including MAGs with 0 abundance. ~70 MAGs removed because they are not in the tree. Ones not in tree all had 0 AMR abundance and were from a variety of host species and studies. At least a couple samples from which missing MAGs were derived did include other MAGs in tree, so it probably wasn't a sample issue.
+phylo_anova_df <- AMR_combined %>% 
+  filter(Scope == "core" & Type == "AMR") %>% 
+  group_by(genome) %>% 
+  summarise(AMR_abundance = n()) %>% 
+  full_join(., select(MAG_meta, genome, common_host, status), by = "genome") %>% 
+  mutate(AMR_abundance = replace_na(AMR_abundance, 0)) %>% 
+  filter(common_host != "Human" & common_host != "Koala") %>% 
+  filter(genome %in% full_tree$tip.label) %>% 
+  column_to_rownames(var = "genome")
+
+#Prune full MAG tree down to those included in the current analysis (Core AMR genes from Animal MAGs - Koala).
+phylo_anova_pruned_tree <- keep.tip.phylo(full_tree, rownames(phylo_anova_df))
+
+
+
+phylo_anova_df <- phylo_anova_df[phylo_anova_pruned_tree$tip.label,]
+pgls_df <- phylo_anova_df %>% rownames_to_column(var = "genome") %>% mutate(AMR_present = AMR_abundance > 0)
+
+AMR_binary <- pgls_df$AMR_present
+names(AMR_binary) <- pgls_df$genome
+
+AMR <- pgls_df$AMR_abundance
+names(AMR) <- pgls_df$genome
+
+status <- pgls_df$status
+names(status) <- pgls_df$genome
+
+common_host <- pgls_df$common_host
+names(common_host) <- pgls_df$genome
+
+
+pgls_df_geomorph <- geomorph.data.frame(
+    AMR_abundance = AMR,
+    status = status,
+    common_host = common_host,
+    AMR_binary = AMR_binary,
+    phy = phylo_anova_pruned_tree
+)
+
+pgls_model <- procD.pgls(
+    AMR ~ status + common_host,
+    phy = phy,
+    data = pgls_df_geomorph,
+    iter = 9999
+)
+
+lm_model <- procD.lm(
+    AMR ~ status + common_host,
+    data = pgls_df_geomorph,
+    iter = 9999
+)
+
+
+summary(pgls_model)
+
+summary(lm_model)
+```
+
+#phylogenetic ANOVA
+```{r}
+#run a real phylogenetic anova
+phylo_anova_pruned_tree
+
+status
+AMR
+sum(is.na(AMR))
+is.binary.tree(phylo_anova_pruned_tree)
+
+phylANOVA(phylo_anova_pruned_tree, status, AMR)
+
+
+phylo_anova_df
+phylANOVA(phylo_anova_pruned_tree, x, y, nsim=1000, posthoc=TRUE, p.adj="holm")
+
+
+pic_AMR <- ape::pic(
+  AMR,
+  ape::multi2di(phylo_anova_pruned_tree, random = FALSE)
+)
+
+summary(pic_AMR)
+mean(pic_AMR^2)
+pic_AMR
+
+write.tree(phylo_anova_pruned_tree, file = "pruned_tree.nwk")
+
+sum(phylo_anova_pruned_tree$edge.length == 0)
+
+phylo_anova_pruned_tree
+
+multi2di(phylo_anova_pruned_tree, random = FALSE)
+
+is.binary(phylo_anova_pruned_tree)
+
+
+pic_out <- ape::pic(
+  AMR[phylo_anova_pruned_tree$tip.label],
+  phylo_anova_pruned_tree,
+  var.contrasts = TRUE
+)
+
+sum(phylo_anova_pruned_tree$edge.length == 0)
+sum(is.na(phylo_anova_pruned_tree$edge.length))
+sum(phylo_anova_pruned_tree$edge.length < 0)
+
+range(phylo_anova_pruned_tree$edge.length)
+
+
+zero_edges <- which(phylo_anova_pruned_tree$edge.length == 0)
+
+child_nodes <- phylo_anova_pruned_tree$edge[zero_edges, 2]
+child_nodes
+sum(child_nodes <= Ntip(phylo_anova_pruned_tree))
+sum(child_nodes > Ntip(phylo_anova_pruned_tree))
+sum(phytools::getDescendants(
+  phylo_anova_pruned_tree, 15
+) <= Ntip(phylo_anova_pruned_tree))
+```
+
+
+
+#Per SGB analysis
+#basic cluster by cluster AMR comparison between wild/captive wildlife
+```{r}
+#There didnt end up being big enough clusters to run this analysis
+
+#number of AMR genes per cluster grouped by wild and captive
+wildlife_amr_counts <- combined_amr_data %>% 
+  filter(Scope == "core", status == "wild" | status == "captive") %>% 
+  group_by(secondary_cluster) %>%
+  summarize(
+    n_genomes_with_amr = n_distinct(genome),
+    n_wild_amr = sum(status == "wild"),
+    n_captive_amr = sum(status == "captive"),
+    .groups = "drop"
+  )
+
+cluster_genome_counts <- cluster_members %>% 
+  filter(status == "wild" | status == "captive") %>% 
+  group_by(secondary_cluster) %>% 
+  summarize(
+    n_genomes = n_distinct(genome),
+    n_wild = sum(status == "wild"),
+    n_captive = sum(status == "captive"),
+    .groups = "drop")
+  
+
+cluster_AMR <- left_join(wildlife_amr_counts, cluster_genome_counts, by = "secondary_cluster")
+
+cluster_AMR %>% filter(n_wild > 0 & n_captive > 0) %>% 
+  mutate(wild = n_wild_amr/n_wild, captive = n_captive_amr/n_captive) %>% 
+  select(secondary_cluster, wild, captive) %>% 
+  pivot_longer(cols = c("wild", "captive"), names_to = "status", values_to = "avg_amr_per_genome") %>% 
+  ggplot(aes(x = secondary_cluster, y = avg_amr_per_genome, fill = status)) +
+  geom_col(position = "dodge")
+  
+
+```
+
+
+#Full sample analysis below
+#read in AMR data and Metadata
+```{r}
+contig_info <- read_table(file = "contigs/contig_stats.txt") %>% 
+  mutate(sample = str_replace(file, ".contigs.fasta", ""), len_mb = sum_len/1000000) %>% 
+  select(-file,-format,-type)
+
+sample_meta <- read_csv(file = "sample_metadata.csv") %>% 
+  left_join(.,contig_info, by = "sample") %>% 
+  filter(common_host != "Koala" & !is.na(common_host))
+
+
+AMR_files_contigs <- list.files("amrfinder_contigs_out", full.names = TRUE, pattern = "\\.tsv$")
+
+AMR_combined_contigs <- rbindlist(
+  lapply(
+    AMR_files_contigs, 
+    function(f){fread(f)[, sample := str_remove(basename(f), "\\.contigs.tsv$")]}
+         ), 
+  fill = TRUE
+) %>% select(sample, everything())
+
+
+sample_AMR <- full_join(AMR_combined_contigs, sample_meta, by = "sample") %>% 
+  filter(!is.na(common_host) & common_host != "Koala") %>% 
+  select(sample, "Element symbol", Scope, Type, common_host, status, City, len_mb) %>% 
+  rename(gene_id = "Element symbol")
+
+sample_meta
+
+```
+
+
+#Bray distance PERMANOVA on full sample set
+```{r}
+bray_df_raw <- sample_AMR %>% 
+  filter(Scope == "core" & Type == "AMR") %>%
+  count(sample, gene_id) %>% 
+  pivot_wider(names_from = gene_id, values_from = n, values_fill = 0) %>%
+  column_to_rownames(var = "sample")
+
+bray_dist_raw <- vegdist(bray_df_raw, method = "bray")
+#Don't need this here, but can use for pcoa later if needed.
+bray_pcoa_raw <- pcoa(bray_dist_raw)
+
+anova_df_raw <- sample_meta %>% filter(sample %in% rownames(bray_df_raw))
+
+bray_df_norm <- sample_AMR %>% 
+  filter(Scope == "core" & Type == "AMR") %>%
+  count(sample, gene_id) %>% 
+  pivot_wider(names_from = gene_id, values_from = n, values_fill = 0) %>% 
+  left_join(., select(sample_meta, sample, len_mb)) %>% 
+  mutate(across(-c(sample, len_mb), ~.x/len_mb)) %>% 
+  select(-len_mb) %>% 
+  column_to_rownames(var = "sample")
+
+bray_dist_norm <- vegdist(bray_df_norm, method = "bray")
+
+#Don't need this here, but can use for pcoa later if needed.
+bray_pcoa_norm <- pcoa(bray_dist_norm)
+
+anova_df_norm <- sample_meta %>% filter(sample %in% rownames(bray_df_norm))
+
+
+
+raw_abundance_Bray_permnova <- adonis2(bray_dist_raw ~ Country + status + common_host, data = anova_df_raw, permutations = 9999, strata = anova_df_raw$common_host, by = "margin")
+
+norm_abundance_Bray_permnova <- adonis2(bray_dist_norm ~ Country + status + common_host, data = anova_df_norm, permutations = 9999, strata = anova_df_norm$common_host, by = "margin")
+
+
+raw_abundance_Bray_permnova
+norm_abundance_Bray_permnova
+
+```
+
+
+#Abundance GLMM on full sample set
+```{r}
+total_abundance_sample_df <- bray_df_raw %>% 
+  mutate(abundance = rowSums(across(everything()))) %>% 
+  select(abundance) %>% 
+  rownames_to_column(var = "sample") %>% 
+  full_join(., select(sample_meta, sample, common_host, status, Country, len_mb), by = "sample") %>% 
+  mutate(abundance = coalesce(abundance, 0), norm_abundance = abundance/len_mb)
+
+
+total_abundance_sample_glmm <- glmmTMB(abundance ~ status + offset(log(len_mb)) + (1 | common_host) + (1 | Country), family = nbinom2, data = total_abundance_sample_df) %>% summary()
+
+total_abundance_sample_glmm
+
+```
+
+
+#Bray distance PERMANOVA on per host species 
+```{r}
+
+#Many of the hosts will fail in this analysis due to low sample size. Only samples with at least 1 AMR gene are included here, so many hosts have their sample sizes reduced further. If a host species ends up with 1 or 0 samples of either wild or captive status the sample PERMANOVA will fail.
+taxa_list <- sample_AMR %>% distinct(common_host) %>% pull(common_host)
+adonis_results_raw_list <- list()
+adonis_results_norm_list <- list()
+
+
+for (level in taxa_list) {
+
+
+  bray_df_raw <- sample_AMR %>% 
+    filter(Scope == "core" & Type == "AMR") %>%
+    filter(common_host == level) %>% 
+    count(sample, gene_id) %>% 
+    pivot_wider(names_from = gene_id, values_from = n, values_fill = 0) %>%
+    column_to_rownames(var = "sample")
+
+  bray_dist_raw <- vegdist(bray_df_raw, method = "bray")
+  
+
+  anova_df_raw <- sample_meta %>% filter(sample %in% rownames(bray_df_raw))
+
+  bray_df_norm <- sample_AMR %>% 
+    filter(Scope == "core" & Type == "AMR") %>%
+    filter(common_host == level) %>%
+    count(sample, gene_id) %>% 
+    pivot_wider(names_from = gene_id, values_from = n, values_fill = 0) %>% 
+    left_join(., select(sample_meta, sample, len_mb)) %>% 
+    mutate(across(-c(sample, len_mb), ~.x/len_mb)) %>% 
+    select(-len_mb) %>% 
+    column_to_rownames(var = "sample")
+
+  bray_dist_norm <- vegdist(bray_df_norm, method = "bray")
+  
+  anova_df_norm <- sample_meta %>% filter(sample %in% rownames(bray_df_norm))
+  
+  if (n_distinct(anova_df_raw$Country) > 1) {
+    model_formula_raw <- bray_dist_raw ~ Country + status
+  } else {
+    model_formula_raw <- bray_dist_raw ~ status
+  }
+  
+  if (n_distinct(anova_df_norm$Country) > 1) {
+    model_formula_norm <- bray_dist_norm ~ Country + status
+  } else {
+    model_formula_norm <- bray_dist_norm ~ status
+  }
+  
+  set.seed(123)
+  
+  adonis_results_raw_list[[level]] <- adonis2(model_formula_raw, data = anova_df_raw, permutations = 9999, by = "margin")
+  
+  set.seed(123)
+  
+  adonis_results_norm_list[[level]] <- adonis2(model_formula_norm, data = anova_df_norm, permutations = 9999, by = "margin")
+  
+
+}
+
+
+adonis_results_raw_list
+adonis_results_norm_list
+
+```
+
+
+
+
+
+#general plotting - without zeros
+```{r}
+AMR_summary <- sample_AMR %>% 
+  group_by(common_host) %>% 
+  summarize(
+    n_wild = n_distinct(sample[status == "wild"]), 
+    n_captive = n_distinct(sample[status == "captive"]), 
+    wild_AMR = sum(status == "wild"),  
+    captive_AMR = sum(status == "captive"), 
+    wild_AMR_per_ind = wild_AMR/n_wild, 
+    captive_AMR_per_ind = captive_AMR/n_captive)
+
+sample_AMR %>% 
+  filter(Scope == "core" & Type == "AMR") %>%
+  count(sample, status) %>%
+  ggplot(aes(x = status, y = n)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1)
+
+sample_AMR
+
+sample_AMR_plot <- sample_AMR %>%
+  filter(Scope == "core" & Type == "AMR") %>%
+  count(sample, common_host, status, len_mb, name = "AMR_abundance") %>%
+  mutate(AMR_abundance_norm = AMR_abundance / len_mb)
+
+sample_AMR_plot
+
+
+# 1. Raw abundance: all captive vs all wild
+raw_all_boxplot <- ggplot(sample_AMR_plot, aes(x = status, y = AMR_abundance)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  labs(x = NULL, y = "AMR abundance") +
+  theme_classic()
+
+# 2. Raw abundance: captive vs wild within each host
+raw_host_species_plot <- ggplot(sample_AMR_plot, aes(x = common_host, y = AMR_abundance, fill = status)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  labs(x = NULL, y = "AMR abundance") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. Normalized abundance: all captive vs all wild
+norm_all_boxplot <- ggplot(sample_AMR_plot,aes(x = status, y = AMR_abundance_norm)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  labs(x = NULL, y = "AMR abundance per Mb") + 
+  theme_classic()
+
+# 4. Normalized abundance: captive vs wild within each host
+norm_host_species_plot <- ggplot(sample_AMR_plot,aes(x = common_host, y = AMR_abundance_norm, fill = status)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  labs(x = NULL, y = "AMR abundance per Mb") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+raw_all_boxplot
+raw_host_species_plot
+norm_all_boxplot
+norm_host_species_plot
+```
+
+
+#general plotting with zeros - do this per MAG as well
+```{r}
+sample_AMR_plot_zeros <- sample_meta %>%
+  select(sample, common_host, status, len_mb) %>%
+  left_join(sample_AMR %>%filter(Scope == "core" & Type == "AMR") %>% 
+  count(sample, name = "AMR_abundance"), by = "sample") %>%
+  mutate(AMR_abundance = replace_na(AMR_abundance, 0),AMR_abundance_norm = AMR_abundance / len_mb) %>% 
+  filter(common_host != "Koala" & !is.na(common_host))
+
+
+sample_AMR_plot_zeros
+
+# 1. Raw abundance: all captive vs all wild
+raw_all_boxplot_zeros <- ggplot(sample_AMR_plot_zeros, aes(x = status, y = AMR_abundance)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  labs(x = NULL, y = "AMR abundance") +
+  theme_classic()
+
+# 2. Raw abundance: captive vs wild within each host
+raw_host_species_plot_zeros <- ggplot(sample_AMR_plot_zeros, aes(x = common_host, y = AMR_abundance, fill = status)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  labs(x = NULL, y = "AMR abundance") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. Normalized abundance: all captive vs all wild
+norm_all_boxplot_zeros <- ggplot(sample_AMR_plot_zeros,aes(x = status, y = AMR_abundance_norm)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  labs(x = NULL, y = "AMR abundance per Mb") + 
+  theme_classic()
+
+# 4. Normalized abundance: captive vs wild within each host
+norm_host_species_plot_zeros <- ggplot(sample_AMR_plot_zeros,aes(x = common_host, y = AMR_abundance_norm, fill = status)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  labs(x = NULL, y = "AMR abundance per Mb") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+raw_all_boxplot_zeros
+raw_host_species_plot_zeros
+
+norm_all_boxplot_zeros
+#order by captive boxplot height
+norm_host_species_plot_zeros
+
+```
+
+
+#PCOA ploting
+```{r}
+var_explained <- bray_pcoa$values$Relative_eig * 100
+var_explained
+coords <- as.data.frame(bray_pcoa$vectors[,1:2])
+coords$sample <- rownames(coords)
+
+coords <- left_join(coords, sample_meta, by = "sample")
+coords
+
+ggplot(coords, aes(x = Axis.1,y = Axis.2, color = status)) +
+  geom_point(size = 3) +
+  xlab(paste0("PCoA1 (", round(var_explained[1],1), "%)")) +
+  ylab(paste0("PCoA2 (", round(var_explained[2],1), "%)")) +
+  theme_classic()
+
+```
+
+
+
+#Full sample AMR class PERMANOVA
+```{r}
+
+AMR_class_df <- full_join(AMR_combined_contigs, sample_meta, by = "sample") %>%
+  filter(!is.na(common_host) & common_host != "Koala") %>% 
+  filter(Scope == "core" & Type == "AMR") %>% 
+  separate_longer_delim(Class, delim = "/") %>% 
+  count(sample, Class, name = "n_hits") %>% 
+  pivot_wider(names_from = "Class", values_from = "n_hits", values_fill = 0) %>% 
+  column_to_rownames(var = "sample")
+
+ARM_class_meta <- sample_meta %>% filter(sample %in% rownames(AMR_class_df))
+
+ARM_class_bray <- vegdist(AMR_class_df, method = "bray")
+
+
+AMR_class_abundance_Bray_permnova <- adonis2(ARM_class_bray ~ Country + status + common_host, data = ARM_class_meta, permutations = 9999, strata = ARM_class_meta$common_host, by = "margin")
+
+
+
+AMR_class_abundance_Bray_permnova
+
+
+```
+
+
+
+#Per gene GLMM
+```{r}
+#GLMM df base
+AMR_trees_base_df <- left_join(AMR_combined_contigs, sample_meta, by = "sample") %>% 
+  filter(common_host != "Koala" & !is.na(common_host)) %>%
+  filter(Scope == "core" & Type == "AMR") %>% 
+  rename(gene_id = "Element symbol")
+
+#GLMM per gene
+#Gene has to be present in at least 15 samples to be included.
+AMR_genes_list <- AMR_trees_base_df %>%
+  distinct(sample, gene_id) %>%
+  count(gene_id, name = "prevalence") %>%
+  filter(prevalence >= 15) %>%
+  pull(gene_id)
+
+AMR_genes_glmm_poisson_model <- list()
+AMR_genes_glmm_nbinom_model <- list() 
+AMR_genes_glmm_poisson_results <- list()
+AMR_genes_glmm_nbinom_results <- list()
+AMR_genes_glmm_selected_model_results <- data.frame()
+
+
+for (gene in AMR_genes_list){
+
+  AMR_trees_GLMM_df <- AMR_trees_base_df %>% 
+    select(sample, gene_id, common_host, status, len_mb) %>% 
+    filter(gene_id == gene) %>% 
+    count(sample, gene_id) %>% 
+    full_join(., select(sample_meta, sample, len_mb, common_host, status, Country)) %>% 
+    mutate(n = coalesce(n, 0))
+  
+  
+  #Create glmm models using both poisson and negative binomial distributions
+  AMR_genes_glmm_poisson_model[[gene]] <- glmmTMB(n ~ status + offset(log(len_mb)) + (1 | common_host) + (1 | Country), family = poisson, data = AMR_trees_GLMM_df)
+  
+  AMR_genes_glmm_nbinom_model[[gene]] <- glmmTMB(n ~ status + offset(log(len_mb)) + (1 | common_host) + (1 | Country), family = nbinom2, data = AMR_trees_GLMM_df)
+  
+  AMR_genes_glmm_poisson_results[[gene]] <- summary(AMR_genes_glmm_poisson_model[[gene]])
+  
+  AMR_genes_glmm_nbinom_results[[gene]] <- summary(AMR_genes_glmm_nbinom_model[[gene]])
+  
+  poisson_aic <- AMR_genes_glmm_poisson_results[[gene]]$AICtab[[1]]
+  negbinom_aic <- AMR_genes_glmm_nbinom_results[[gene]]$AICtab[[1]]
+
+  
+  #select appropriate model using AIC and then run some qc checks
+  if (is.na(negbinom_aic) || poisson_aic <= negbinom_aic) {
+  
+      selected_model <- "poisson"
+      selected_results <- AMR_genes_glmm_poisson_results[[gene]]
+      
+      
+      model_qc <- simulateResiduals(AMR_genes_glmm_poisson_model[[gene]])
+      Uniformity_pvalue <- testUniformity(model_qc, plot = FALSE)$p.value
+      Dispersion_pvalue <- testDispersion(model_qc, plot = FALSE)$p.value
+      zero_infliation_pvalue <- testZeroInflation(model_qc, plot = FALSE)$p.value
+  
+    } else {
+  
+      selected_model <- "negative_binomial"
+      selected_results <- AMR_genes_glmm_nbinom_results[[gene]]
+      
+      model_qc <- simulateResiduals(AMR_genes_glmm_nbinom_model[[gene]])
+      Uniformity_pvalue <- testUniformity(model_qc, plot = FALSE)$p.value
+      Dispersion_pvalue <- testDispersion(model_qc, plot = FALSE)$p.value
+      zero_infliation_pvalue <- testZeroInflation(model_qc, plot = FALSE)$p.value
+  
+    }
+
+  estimate <- selected_results$coefficients$cond["statuswild", "Estimate"]
+
+  p_value <- selected_results$coefficients$cond["statuswild", "Pr(>|z|)"]
+
+  #create df of sample information, model results/information, and QC
+  AMR_genes_glmm_selected_model_results <- bind_rows(AMR_genes_glmm_selected_model_results, data.frame(
+    gene_id = gene,
+    estimate_wild = estimate,
+    fold_change = exp(estimate),
+    p_value = p_value,
+    model_qc_flag = Uniformity_pvalue < 0.05 | Dispersion_pvalue < 0.05 | zero_infliation_pvalue < 0.05,
+    selected_model = selected_model,
+    poisson_aic = poisson_aic,
+    negbinom_aic = negbinom_aic,
+    count_mean = mean(AMR_trees_GLMM_df$n),
+    count_var = var(AMR_trees_GLMM_df$n),
+    Uniformity_pvalue = Uniformity_pvalue,
+    Dispersion_pvalue = Dispersion_pvalue,
+    zero_infliation_pvalue = zero_infliation_pvalue
+    
+  ))
+  
+  }
+
+#Multiple comparisons adjustment to p_values using Benjamini–Hochberg correction
+AMR_genes_glmm_selected_model_results$fdr <- p.adjust(AMR_genes_glmm_selected_model_results$p_value, method = "BH")
+
+AMR_genes_glmm_selected_model_results <- AMR_genes_glmm_selected_model_results %>% 
+  select(gene_id, estimate_wild, fold_change, p_value, fdr, everything())
+
+#Per AMR gene wild/captive association
+AMR_genes_glmm_selected_model_results
+
+#little histogram to visualize gene counts across samples. Will display counts for gene that is currently described by the gene var in the above loop. 
+#AMR_trees_GLMM_df %>% ggplot(aes(x = n)) +
+#  geom_histogram()
+
+```
+
+#Human plus animal AMR gene trees
+```{r}
+
+sample_meta_humans <- read_csv(file = "sample_metadata.csv") %>% 
+  left_join(.,contig_info, by = "sample") %>% 
+  mutate(common_host = replace_na(common_host, "human"), status = replace_na(status, "human")) %>% 
+  filter(common_host != "Koala")
+
+#slighty different from similar dataframes in that it includes humans and does not include samples without any AMR (uses left_join rather than full_join). 
+sample_AMR_humans <- left_join(AMR_combined_contigs, sample_meta_humans, by = "sample") %>% 
+  filter(common_host != "Koala") %>% 
+  select(sample, "Element symbol", Scope, Type, common_host, status, City, len_mb, "Protein id", Start, Stop, Strand, "Contig id", "% Coverage of reference") %>% 
+  rename(contig_id = "Contig id", gene_id = "Element symbol", coverage_of_reference = "% Coverage of reference", protein_id = "Protein id") %>% 
+  filter(Scope == "core" & Type == "AMR")
+
+#MAG df used as a key to add bacterial taxonomy of those genes that were included in a MAG
+MAG_key_df <- combined_amr_data %>% 
+  filter(Scope == "core" & Type == "AMR") %>% 
+  rename(contig_id = "Contig id", sample = sample_id, gene_id = "Element symbol", coverage_of_reference = "% Coverage of reference") %>% 
+  select(sample, gene_id, Start, Stop, Strand, coverage_of_reference, genome, phylum, class, family, genus, species)
+
+#Add bacterial taxonomic info to genes that were included in a MAG. Genes without taxonomy info are on contigs that were not included in a MAG.
+sample_AMR_humans <- left_join(sample_AMR_humans, MAG_key_df, by = c("sample", "gene_id", "Start", "Stop", "Strand", "coverage_of_reference"))
+
+#I want to know for each gene how many human, wild, captive counts.
+sample_gene_summary <- sample_AMR_humans %>% 
+  group_by(gene_id) %>% 
+  summarise(n = n(), n_wild = sum(status == "wild"), n_captive = sum(status == "captive"), n_human = sum(status == "human"))
+
+
+sample_gene_tree_list <- sample_gene_summary %>% 
+  filter(n_wild >= 5 & n_captive >= 5 & n_human >= 5) %>% 
+  pull(gene_id)
+
+
+
+sample_hits <- sample_AMR_humans %>% filter(gene_id %in% sample_gene_tree_list)
+AMR_seqs_df <- list()
+
+
+for (samp in unique(sample_hits$sample)){
+  
+  seqs_df_tmp <- sample_hits %>% filter(sample == samp)
+  
+  fna_file <- paste0("contig_annotations/", samp, ".contigs/", samp, ".contigs.fna")
+  
+  fna_seqs <- readDNAStringSet(fna_file)
+  
+  names(fna_seqs) <- sub(" .*", "", names(fna_seqs))
+  
+  
+  
+  AMR_seqs_df[[samp]] <-seqs_df_tmp %>% 
+    mutate(sequence = pmap_chr(pick(contig_id, Start, Stop, Strand), 
+    function(contig_id, Start, Stop, Strand) {
+      
+      seq <- subseq(fna_seqs[[contig_id]], start = Start, end = Stop)
+                        
+      if (Strand == "-") {
+        seq <- reverseComplement(seq)
+        }
+      
+      as.character(seq)
+  }))
+}
+
+
+AMR_seqs_df <- bind_rows(AMR_seqs_df)
+
+AMR_seqs_df
+
+gene_lookup <- AMR_seqs_df %>%
+  distinct(gene_id) %>%
+  mutate(gene_num = paste0("gene_", row_number()))
+
+AMR_seqs_df <- AMR_seqs_df %>%
+  left_join(gene_lookup, by = "gene_id") %>%
+  group_by(gene_id) %>%
+  mutate(seq_id = paste0("seq_", row_number())) %>%
+  ungroup()
+
+AMR_seqs_df %>% 
+  split(.$gene_num) %>% iwalk(function(df, gene) {
+
+    seqs <- DNAStringSet(df$sequence)
+
+    names(seqs) <- df$seq_id
+
+    writeXStringSet(
+      seqs,
+      paste0("AMR_gene_fastas/", gene, ".fasta")
+    )
+  })
+
+#AMR_seqs_df %>% select(sample, gene_id, gene_num, seq_id, common_host, status, City, genome, phylum, class, family, genus, species) %>% write_delim(file = "AMR_gene_fastas/lookup_table.txt")
+
+#Command used to align Fastas
+#parallel -j 5 '/programs/mafft/bin/mafft --thread 5 --localpair --maxiterate 1000 {} > {/.}.align' ::: *.fasta
+
+#Command used to infer trees from alignments
+#parallel -j 5 /programs/iqtree-2.4.0/bin/iqtree2 -s {} -m MFP --seed 0 --prefix {/.} -T 10 -B 1000 ::: *.align
+```
+
+
+#Gene trees vis
+```{r}
+AMR_seqs_df %>% select(sample, gene_id, gene_num, seq_id, common_host, status, City, genome, phylum, class, family, genus, species)
+
+
+
+make_gene_tree <- function(tree){
+
+gene_tree<- read.tree(paste0("AMR_gene_fastas/iqtree_outs/", tree, ".treefile"))
+
+gene_meta <- AMR_seqs_df %>%
+  filter(gene_num == tree) %>%
+  select(seq_id, sample, status, common_host) %>% 
+  rename(label = seq_id)
+
+ggtree(gene_tree) %<+% gene_meta + geom_tippoint(aes(color = status),size = 1)
+
+}
+
+
+
+make_gene_tree("gene_29")
+
+
+```
+
+
+
